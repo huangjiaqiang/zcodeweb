@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ZCode SIM</title>
+<style>
+  html,body{margin:0;height:100%;background:#111;color:#eee;font:14px/1.4 -apple-system,sans-serif}
+  #wrap{display:flex;flex-direction:column;height:100%}
+  #top{padding:10px}
+  #statusbox{padding:8px 10px}
+  #status{display:inline-block;padding:4px 10px;border-radius:4px;background:#333}
+  #h1{padding:0 10px;color:#ff8a80}
+  #notice{display:none;padding:4px 10px;color:#ffd54f}
+  #log{flex:1;overflow:auto;background:#000;color:#7CFC00;font:9px/1.25 monospace;padding:6px;white-space:pre-wrap}
+  button{margin:2px;padding:8px 10px}
+</style>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var mode = q.get('mode') || 'observe';
+  var kind = q.get('kind') || 'status';
+  var logs = [];
+  var origVis = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState');
+  var origHidden = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+
+  function L(m) {
+    var line = new Date().toISOString().slice(11, 23) + ' ' + m;
+    logs.push(line);
+    if (logs.length > 60) logs.shift();
+    try { ZCProbe.log('SIM[' + mode + '] ' + m); } catch (e) {}
+    var el = document.getElementById('log');
+    if (el) el.textContent = logs.join('\n');
+  }
+  window.SIMLOG = L;
+
+  function real() {
+    try {
+      return 'realVis=' + (origVis && origVis.get ? origVis.get.call(document) : '?') +
+             ' realHidden=' + (origHidden && origHidden.get ? origHidden.get.call(document) : '?');
+    } catch (e) { return 'real=?'; }
+  }
+  function vis() { return 'vis=' + document.visibilityState + ' hidden=' + document.hidden + ' focus=' + document.hasFocus() + ' ' + real(); }
+
+  // Log every event first (so shim's swallow cannot hide it from us).
+  window.addEventListener('visibilitychange', function () { L('EVT visibilitychange ' + vis()); }, true);
+  window.addEventListener('focus', function () { L('EVT focus ' + vis()); }, true);
+  window.addEventListener('blur', function () { L('EVT blur ' + vis()); }, true);
+  window.addEventListener('pagehide', function () { L('EVT pagehide ' + vis()); }, true);
+  window.addEventListener('pageshow', function () { L('EVT pageshow ' + vis()); }, true);
+  window.addEventListener('online', function () { L('EVT online'); }, true);
+  window.addEventListener('offline', function () { L('EVT offline'); }, true);
+
+  if (mode === 'shim') {
+    try {
+      Object.defineProperty(Document.prototype, 'visibilityState', { configurable: true, get: function () { return 'visible'; } });
+      Object.defineProperty(Document.prototype, 'hidden', { configurable: true, get: function () { return false; } });
+      Object.defineProperty(Document.prototype, 'webkitVisibilityState', { configurable: true, get: function () { return 'visible'; } });
+      Object.defineProperty(Document.prototype, 'webkitHidden', { configurable: true, get: function () { return false; } });
+      L('SHIM visibility faked');
+    } catch (e) { L('SHIM visibility fail ' + e); }
+    var swallow = function (e) { e.stopImmediatePropagation(); };
+    window.addEventListener('visibilitychange', swallow, true);
+    document.addEventListener('visibilitychange', swallow, true);
+    L('SHIM visibilitychange swallowed');
+    try {
+      Document.prototype.hasFocus = function () { return false; };
+      L('SHIM hasFocus faked=false');
+    } catch (e) { L('SHIM hasFocus fail ' + e); }
+  }
+
+  L('page start ' + vis() + ' Notification=' + (typeof window.Notification));
+
+  // ---- simulated ZCode remote-control behavior ----
+  var ws = null, connected = false, suspended = false, hbTimer = null, hbCount = 0;
+
+  function setStatus(text, notice) {
+    var s = document.getElementById('status');
+    var n = document.getElementById('notice');
+    if (s) s.textContent = text;
+    if (n) n.style.display = notice ? 'block' : 'none';
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    hbTimer = setInterval(function () {
+      if (ws && ws.readyState === 1) {
+        hbCount++;
+        ws.send('hb ' + hbCount + ' ' + Date.now());
+        L('HB sent #' + hbCount);
+      } else {
+        L('HB skipped state=' + (ws ? ws.readyState : 'null'));
+      }
+    }, 5000);
+  }
+  function stopHeartbeat() { if (hbTimer) { clearInterval(hbTimer); hbTimer = null; } }
+
+  function connect() {
+    if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+    L('WS connecting...');
+    setStatus('connecting...', false);
+    ws = new WebSocket('ws://' + location.host + '/ws?mode=' + mode);
+    ws.onopen = function () { connected = true; suspended = false; L('WS open'); setStatus('connected', false); startHeartbeat(); };
+    ws.onmessage = function (e) {
+      L('WS msg ' + e.data);
+      if (String(e.data).indexOf('task_done') >= 0) notify('任务完成，请查看');
+    };
+    ws.onclose = function (e) { connected = false; stopHeartbeat(); L('WS close code=' + e.code + ' clean=' + e.wasClean); setStatus('closed', false); };
+    ws.onerror = function () { L('WS error'); };
+  }
+
+  function disconnect(why) {
+    if (ws) { L('closing WS (' + why + ')'); try { ws.close(1000, why); } catch (e) {} ws = null; }
+    stopHeartbeat();
+    connected = false;
+    setStatus('suspended', true);
+  }
+
+  function suspend() {
+    if (suspended) return;
+    suspended = true;
+    L('SUSPEND (page hidden)');
+    disconnect('visibility-hidden');
+  }
+
+  function recover() {
+    if (!suspended) return;
+    L('RECOVER');
+    suspended = false;
+    setStatus('recovering...', true);
+    setTimeout(function () {
+      if (!connected) { L('RECOVERY TIMEOUT 15s'); setStatus('connection-recovery-timeout', false); }
+    }, 15000);
+    connect();
+  }
+
+  // This is the handler the real page uses to suspend on hidden.
+  document.addEventListener('visibilitychange', function () {
+    L('APP handler visibility=' + document.visibilityState);
+    if (document.visibilityState === 'hidden') suspend(); else recover();
+  });
+
+  function notify(txt) {
+    L('notify attempt Notification=' + (typeof window.Notification) + ' perm=' + (typeof window.Notification !== 'undefined' ? Notification.permission : 'n/a'));
+    try {
+      if (typeof window.Notification !== 'undefined') {
+        var title = kind === 'interaction' ? '需要你的确认' : 'ZCode SIM 任务通知';
+        var n = new Notification(title, { body: txt });
+        n.onclick = function () { L('notification clicked'); };
+        L('Notification created');
+      } else {
+        L('Notification API unavailable');
+      }
+    } catch (e) { L('notify fail ' + e); }
+  }
+  window.SIM_NOTIFY = notify;
+
+  // timer-throttling probe: 1s tick, delta tells us if the renderer is throttled
+  var lastTick = Date.now();
+  setInterval(function () {
+    var now = Date.now();
+    L('TICK1s delta=' + (now - lastTick));
+    lastTick = now;
+  }, 1000);
+
+  window.addEventListener('load', function () {
+    L('load event ' + vis());
+    connect();
+  });
+})();
+</script>
+</head>
+<body>
+<div id="wrap">
+  <div id="top">
+    <button onclick="location.search='?mode=observe'">observe 模式</button>
+    <button onclick="location.search='?mode=shim'">shim 模式</button>
+    <button id="btnnotify">模拟任务完成</button>
+  </div>
+  <div id="statusbox"><span id="status">booting</span> <span id="notice" data-web-remote-control-reconnect-notice="true">正在自动重连...</span></div>
+  <h1 id="h1"></h1>
+  <div id="log"></div>
+</div>
+<script>
+  document.getElementById('btnnotify').addEventListener('click', function () {
+    if (window.SIM_NOTIFY) window.SIM_NOTIFY('手动触发');
+  });
+</script>
+</body>
+</html>

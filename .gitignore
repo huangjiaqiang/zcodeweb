@@ -1,0 +1,16 @@
+# build artifacts (APKs embed the personal session URL)
+app/out/
+probe/out/
+
+# signing keys
+*.keystore
+
+# personal session URL overlay
+app/src/com/zcoderemote/app/Local.java
+
+# runtime logs
+sim/server.log
+*.log
+
+# OS
+.DS_Store
